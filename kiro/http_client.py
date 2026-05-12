@@ -227,7 +227,12 @@ class KiroHttpClient:
                 
                 # 403 - token expired, refresh and retry
                 if response.status_code == 403:
-                    logger.warning(f"Received 403, refreshing token (attempt {attempt + 1}/{MAX_RETRIES})")
+                    try:
+                        error_body = await response.aread()
+                        error_text = error_body.decode('utf-8', errors='replace')[:1000] if error_body else "(empty body)"
+                        logger.warning(f"Received 403 (body: {error_text}), refreshing token (attempt {attempt + 1}/{MAX_RETRIES})")
+                    except Exception as e:
+                        logger.warning(f"Received 403 (could not read body: {e}), refreshing token (attempt {attempt + 1}/{MAX_RETRIES})")
                     await self.auth_manager.force_refresh()
                     continue
                 

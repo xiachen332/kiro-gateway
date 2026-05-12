@@ -537,6 +537,14 @@ Examples:
         version=f"%(prog)s {APP_VERSION}"
     )
     
+    parser.add_argument(
+        "-w", "--workers",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Number of worker processes (default: 1, env: UVICORN_WORKERS)"
+    )
+    
     return parser.parse_args()
 
 
@@ -577,11 +585,21 @@ def resolve_server_config(args: argparse.Namespace) -> tuple[str, int]:
         final_port = DEFAULT_SERVER_PORT
         port_source = "default"
     
+    # Workers resolution: CLI > ENV > Default
+    default_workers = int(os.getenv("UVICORN_WORKERS", "1"))
+    if args.workers is not None:
+        final_workers = args.workers
+        workers_source = "CLI argument"
+    else:
+        final_workers = default_workers
+        workers_source = "environment variable" if os.getenv("UVICORN_WORKERS") else "default"
+    
     # Log configuration sources for transparency
     logger.debug(f"Host: {final_host} (from {host_source})")
     logger.debug(f"Port: {final_port} (from {port_source})")
+    logger.debug(f"Workers: {final_workers} (from {workers_source})")
     
-    return final_host, final_port
+    return final_host, final_port, final_workers
 
 
 def print_startup_banner(host: str, port: int) -> None:
@@ -606,18 +624,18 @@ def print_startup_banner(host: str, port: int) -> None:
     url = f"http://{display_host}:{port}"
     
     print()
-    print(f"  {WHITE}{BOLD}👻 {APP_TITLE} v{APP_VERSION}{RESET}")
+    print(f"  {WHITE}{BOLD}Kiro Gateway v{APP_VERSION}{RESET}")
     print()
     print(f"  {WHITE}Server running at:{RESET}")
-    print(f"  {GREEN}{BOLD}➜  {url}{RESET}")
+    print(f"  {GREEN}{BOLD}>  {url}{RESET}")
     print()
     print(f"  {DIM}API Docs:      {url}/docs{RESET}")
     print(f"  {DIM}Health Check:  {url}/health{RESET}")
     print()
-    print(f"  {DIM}{'─' * 48}{RESET}")
-    print(f"  {WHITE}💬 Found a bug? Need help? Have questions?{RESET}")
-    print(f"  {YELLOW}➜  https://github.com/jwadow/kiro-gateway/issues{RESET}")
-    print(f"  {DIM}{'─' * 48}{RESET}")
+    print(f"  {DIM}{'-' * 48}{RESET}")
+    print(f"  {WHITE}Found a bug? Need help? Have questions?{RESET}")
+    print(f"  {YELLOW}>  https://github.com/jwadow/kiro-gateway/issues{RESET}")
+    print(f"  {DIM}{'-' * 48}{RESET}")
     print()
 
 
@@ -635,17 +653,21 @@ if __name__ == "__main__":
     args = parse_cli_args()
     
     # Resolve final configuration with priority hierarchy
-    final_host, final_port = resolve_server_config(args)
+    final_host, final_port, final_workers = resolve_server_config(args)
     
     # Print startup banner
     print_startup_banner(final_host, final_port)
     
-    logger.info(f"Starting Uvicorn server on {final_host}:{final_port}...")
+    if final_workers > 1:
+        logger.info(f"Starting Uvicorn server on {final_host}:{final_port} with {final_workers} workers...")
+    else:
+        logger.info(f"Starting Uvicorn server on {final_host}:{final_port}...")
     
     # Use string reference to avoid double module import
     uvicorn.run(
         "main:app",
         host=final_host,
         port=final_port,
+        workers=final_workers,
         log_config=UVICORN_LOG_CONFIG,
     )

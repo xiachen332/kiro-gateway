@@ -28,6 +28,7 @@ Contains all API endpoints:
 
 import json
 from datetime import datetime, timezone
+from typing import Any, AsyncGenerator, Dict, List, Optional, Union
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, Security
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -38,10 +39,12 @@ from kiro.config import (
     PROXY_API_KEY,
     APP_VERSION,
 )
+from pydantic import BaseModel
 from kiro.models_openai import (
     OpenAIModel,
     ModelList,
     ChatCompletionRequest,
+    ChatMessage,
 )
 from kiro.auth import KiroAuthManager, AuthType
 from kiro.cache import ModelInfoCache
@@ -135,19 +138,28 @@ async def get_models(request: Request):
     logger.info("Request to /v1/models")
     
     model_resolver: ModelResolver = request.app.state.model_resolver
+    model_cache: ModelInfoCache = request.app.state.model_cache
     
     # Get all available models from resolver (cache + hidden models)
     available_model_ids = model_resolver.get_available_models()
     
-    # Build OpenAI-compatible model list
-    openai_models = [
-        OpenAIModel(
-            id=model_id,
-            owned_by="anthropic",
-            description="Claude model via Kiro API"
+    # Build OpenAI-compatible model list with metadata
+    openai_models = []
+    for model_id in available_model_ids:
+        # Get model info from cache for token limits
+        model_info = model_cache.get(model_id)
+        max_input = model_cache.get_max_input_tokens(model_id) if model_info else 200000
+        
+        openai_models.append(
+            OpenAIModel(
+                id=model_id,
+                owned_by="anthropic",
+                description="Claude model via Kiro API",
+                context_window=max_input,
+                max_tokens=8192,
+                capabilities={"text_generation": True, "vision": True}
+            )
         )
-        for model_id in available_model_ids
-    ]
     
     return ModelList(data=openai_models)
 
@@ -467,3 +479,311 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
         if debug_logger:
             debug_logger.flush_on_error(500, str(e))
         raise HTTPException(status_code=500, detail=f"Internal Server Error: {str(e)}")
+
+
+# ==================================================================================================
+# /v1/responses - OpenAI Responses API (Codex CLI compatible)
+# ==================================================================================================
+
+class ResponseInputItem(BaseModel):
+    """Input item for Responses API"""
+    role: str
+    content: Union[str, List[Any], Any]
+
+class ResponseRequest(BaseModel):
+    """OpenAI Responses API request format"""
+    model: str
+    input: Optional[Union[str, List[ResponseInputItem]]] = None
+    instructions: Optional[str] = None
+    tools: Optional[List[Any]] = None
+    tool_choice: Optional[Any] = None
+    stream: bool = False
+    temperature: Optional[float] = None
+    max_output_tokens: Optional[int] = None
+    top_p: Optional[float] = None
+    presence_penalty: Optional[float] = None
+    frequency_penalty: Optional[float] = None
+    previous_response_id: Optional[str] = None
+    store: bool = False
+    metadata: Optional[Dict[str, Any]] = None
+    user: Optional[str] = None
+
+
+async def convert_chat_sse_to_responses_sse(
+    chat_stream: AsyncGenerator[bytes, None],
+    model: str,
+    response_id: str
+) -> AsyncGenerator[str, None]:
+    """
+    Convert chat.completions SSE stream to OpenAI Responses API SSE format.
+    
+    Codex CLI expects Responses API streaming events:
+    - response.created
+    - response.output_item.added
+    - response.content_part.added
+    - response.output_text.delta
+    - response.content_part.done
+    - response.output_item.done
+    - response.completed
+    """
+    has_started = False
+    output_index = 0
+    content_index = 0
+    message_id = f"msg_{response_id}"
+    accumulated_text = ""
+    
+    async for chunk_bytes in chat_stream:
+        # Handle both bytes and str (Starlette may yield either)
+        if isinstance(chunk_bytes, bytes):
+            chunk_text = chunk_bytes.decode('utf-8')
+        else:
+            chunk_text = str(chunk_bytes)
+        
+        for line in chunk_text.split('\n'):
+            line = line.strip()
+            if not line:
+                continue
+            
+            if not line.startswith('data:'):
+                continue
+            
+            data_str = line[5:].strip()
+            
+            if data_str == '[DONE]':
+                # Final completion event
+                completed_event = {
+                    "type": "response.completed",
+                    "response": {
+                        "id": response_id,
+                        "object": "response",
+                        "status": "completed",
+                        "model": model,
+                        "output": []
+                    }
+                }
+                yield f"data: {json.dumps(completed_event, ensure_ascii=False)}\n\n"
+                continue
+            
+            try:
+                chat_data = json.loads(data_str)
+                delta = chat_data.get("choices", [{}])[0].get("delta", {})
+                finish_reason = chat_data.get("choices", [{}])[0].get("finish_reason")
+                
+                # Start of stream - emit initialization events
+                if not has_started and (delta.get("role") or delta.get("content") or delta.get("reasoning_content")):
+                    has_started = True
+                    
+                    # response.created
+                    yield f"data: {json.dumps({'type': 'response.created', 'response': {'id': response_id, 'object': 'response', 'status': 'in_progress', 'model': model}}, ensure_ascii=False)}\n\n"
+                    
+                    # response.output_item.added
+                    yield f"data: {json.dumps({'type': 'response.output_item.added', 'output_index': output_index, 'item': {'type': 'message', 'id': message_id, 'status': 'in_progress', 'role': 'assistant'}}, ensure_ascii=False)}\n\n"
+                    
+                    # response.content_part.added
+                    yield f"data: {json.dumps({'type': 'response.content_part.added', 'output_index': output_index, 'content_index': content_index, 'part': {'type': 'output_text', 'text': ''}}, ensure_ascii=False)}\n\n"
+                
+                # Content delta
+                content = delta.get("content", "")
+                reasoning = delta.get("reasoning_content", "")
+                text_delta = content or reasoning
+                
+                if text_delta:
+                    accumulated_text += text_delta
+                    delta_event = {
+                        "type": "response.output_text.delta",
+                        "output_index": output_index,
+                        "content_index": content_index,
+                        "delta": text_delta
+                    }
+                    yield f"data: {json.dumps(delta_event, ensure_ascii=False)}\n\n"
+                
+                # Tool calls (pass through as-is for now)
+                if "tool_calls" in delta:
+                    tool_calls = delta["tool_calls"]
+                    for tc in tool_calls:
+                        tool_event = {
+                            "type": "response.function_call_arguments.delta",
+                            "output_index": output_index,
+                            "item_id": tc.get("id", ""),
+                            "delta": json.dumps(tc.get("function", {}), ensure_ascii=False)
+                        }
+                        yield f"data: {json.dumps(tool_event, ensure_ascii=False)}\n\n"
+                
+                # Finish - emit completion events
+                if finish_reason:
+                    # content_part.done
+                    yield f"data: {json.dumps({'type': 'response.content_part.done', 'output_index': output_index, 'content_index': content_index, 'part': {'type': 'output_text', 'text': accumulated_text}}, ensure_ascii=False)}\n\n"
+                    
+                    # output_item.done
+                    yield f"data: {json.dumps({'type': 'response.output_item.done', 'output_index': output_index, 'item': {'type': 'message', 'id': message_id, 'status': 'completed', 'role': 'assistant'}}, ensure_ascii=False)}\n\n"
+                    
+                    # response.completed
+                    completed_event = {
+                        "type": "response.completed",
+                        "response": {
+                            "id": response_id,
+                            "object": "response",
+                            "status": "completed",
+                            "model": model,
+                            "output": []
+                        }
+                    }
+                    yield f"data: {json.dumps(completed_event, ensure_ascii=False)}\n\n"
+            
+            except json.JSONDecodeError:
+                continue
+            except Exception as e:
+                logger.warning(f"Error converting SSE chunk: {e}")
+                continue
+
+
+@router.post("/v1/responses", dependencies=[Depends(verify_api_key)])
+async def responses_endpoint(request: Request, request_data: ResponseRequest):
+    """
+    OpenAI Responses API endpoint - compatible with Codex CLI.
+    
+    Converts Responses API requests to chat.completions format
+    and translates responses back to Responses API format.
+    """
+    logger.info(f"Request to /v1/responses (model={request_data.model}, stream={request_data.stream})")
+    
+    # Convert Responses API request to ChatCompletionRequest
+    messages = []
+    
+    # instructions → system message
+    if request_data.instructions:
+        messages.append(ChatMessage(role="system", content=request_data.instructions))
+    
+    # input → messages
+    if request_data.input:
+        if isinstance(request_data.input, str):
+            messages.append(ChatMessage(role="user", content=request_data.input))
+        elif isinstance(request_data.input, list):
+            for item in request_data.input:
+                if isinstance(item, dict):
+                    messages.append(ChatMessage(role=item.get("role", "user"), content=item.get("content", "")))
+                elif hasattr(item, 'role') and hasattr(item, 'content'):
+                    messages.append(ChatMessage(role=item.role, content=item.content))
+    
+    # Build ChatCompletionRequest
+    chat_request = ChatCompletionRequest(
+        model=request_data.model,
+        messages=messages,
+        tools=request_data.tools,
+        tool_choice=request_data.tool_choice,
+        stream=request_data.stream,
+        temperature=request_data.temperature,
+        max_tokens=request_data.max_output_tokens,
+        top_p=request_data.top_p,
+        presence_penalty=request_data.presence_penalty,
+        frequency_penalty=request_data.frequency_penalty,
+        user=request_data.user,
+        store=request_data.store
+    )
+    
+    # Reuse chat_completions logic
+    result = await chat_completions(request, chat_request)
+    
+    # Convert response back to Responses API format
+    if isinstance(result, StreamingResponse):
+        # Convert SSE stream from chat.completions format to Responses API format
+        response_id = f"resp_{generate_conversation_id()}"
+        converted_stream = convert_chat_sse_to_responses_sse(
+            result.body_iterator,
+            request_data.model,
+            response_id
+        )
+        return StreamingResponse(converted_stream, media_type="text/event-stream")
+    
+    # Non-streaming: convert JSON response
+    if isinstance(result, JSONResponse):
+        chat_response = result.body
+        if hasattr(chat_response, 'decode'):
+            chat_response = json.loads(chat_response.decode('utf-8'))
+        elif isinstance(chat_response, bytes):
+            chat_response = json.loads(chat_response.decode('utf-8'))
+        elif isinstance(chat_response, str):
+            chat_response = json.loads(chat_response)
+        
+        # Build Responses API response
+        response_id = chat_response.get("id", f"resp_{generate_conversation_id()}")
+        created_at = chat_response.get("created", int(datetime.now(timezone.utc).timestamp()))
+        model = chat_response.get("model", request_data.model)
+        choices = chat_response.get("choices", [])
+        usage = chat_response.get("usage", {})
+        
+        # Convert choices to output items
+        output = []
+        for choice in choices:
+            message = choice.get("message", {})
+            role = message.get("role", "assistant")
+            content = message.get("content", "")
+            tool_calls = message.get("tool_calls", [])
+            
+            output_item = {
+                "type": "message",
+                "id": f"msg_{generate_conversation_id()}",
+                "status": "completed",
+                "role": role,
+                "content": []
+            }
+            
+            if content:
+                output_item["content"].append({
+                    "type": "output_text",
+                    "text": content
+                })
+            
+            if tool_calls:
+                for tc in tool_calls:
+                    output_item["content"].append({
+                        "type": "tool_call",
+                        "id": tc.get("id", ""),
+                        "call_id": tc.get("id", ""),
+                        "name": tc.get("function", {}).get("name", ""),
+                        "arguments": tc.get("function", {}).get("arguments", "")
+                    })
+            
+            output.append(output_item)
+        
+        responses_api_response = {
+            "id": response_id,
+            "object": "response",
+            "created_at": created_at,
+            "model": model,
+            "output": output,
+            "usage": {
+                "input_tokens": usage.get("prompt_tokens", 0),
+                "output_tokens": usage.get("completion_tokens", 0),
+                "total_tokens": usage.get("total_tokens", 0)
+            },
+            "incomplete_details": None,
+            "instructions": request_data.instructions,
+            "max_output_tokens": request_data.max_output_tokens,
+            "temperature": request_data.temperature,
+            "top_p": request_data.top_p,
+            "tool_choice": request_data.tool_choice,
+            "tools": request_data.tools,
+            "parallel_tool_calls": True,
+            "store": request_data.store,
+            "metadata": request_data.metadata,
+            "user": request_data.user
+        }
+        
+        return JSONResponse(content=responses_api_response)
+    
+    # Fallback: pass through original response
+    return result
+
+
+# Alias for Codex CLI compatibility when base_url doesn't include /v1 suffix
+@router.post("/responses", dependencies=[Depends(verify_api_key)])
+async def responses_without_v1(request: Request, request_data: ResponseRequest):
+    """
+    Alias endpoint for /v1/responses.
+    
+    Codex CLI may send requests to /responses directly when OPENAI_BASE_URL
+    is configured without a /v1 suffix. This endpoint forwards to the
+    main /v1/responses handler.
+    """
+    return await responses_endpoint(request, request_data)

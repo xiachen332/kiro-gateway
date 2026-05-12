@@ -222,6 +222,8 @@ HIDDEN_MODELS: Dict[str, str] = {
 # - Avoid conflicts with IDE-specific model names (e.g., Cursor's "auto")
 # - Create user-friendly shortcuts (e.g., "my-opus" → "claude-opus-4.5")
 # - Support legacy model names from other providers
+# - Codex CLI compatibility: Codex has a hardcoded model catalog and only recognizes
+#   certain OpenAI model names. Add aliases here to make kiro models work with Codex.
 #
 # Example:
 #   MODEL_ALIASES = {
@@ -231,8 +233,18 @@ HIDDEN_MODELS: Dict[str, str] = {
 #   }
 #
 # Default: {"auto-kiro": "auto"} to avoid Cursor IDE conflict
+# Plus Codex CLI compatible aliases (gpt-4o, gpt-4o-mini, etc.)
 MODEL_ALIASES: Dict[str, str] = {
     "auto-kiro": "auto",  # Default alias to avoid Cursor's "auto" model conflict
+    # Codex CLI compatible aliases - these map to Claude models but appear as GPT models
+    # so Codex CLI's hardcoded model catalog recognizes them
+    "gpt-4o": "claude-sonnet-4",
+    "gpt-5.4": "claude-sonnet-4.5",  # Codex CLI sends lowercase
+    "GPT-5.4": "claude-sonnet-4.5",  # Also accept uppercase (legacy)
+    "gpt-4": "claude-opus-4.5",
+    "gpt-4o-mini": "claude-haiku-4.5",
+    "o3-mini": "claude-sonnet-4",
+    "o1": "claude-opus-4.5",
 }
 
 # Models to hide from /v1/models endpoint.
@@ -245,7 +257,8 @@ MODEL_ALIASES: Dict[str, str] = {
 #   HIDDEN_FROM_LIST = ["auto", "claude-old-model"]
 #
 # Default: ["auto"] to show only "auto-kiro" alias
-HIDDEN_FROM_LIST: List[str] = ["auto"]
+# Also hide original Claude names when using GPT aliases (optional)
+HIDDEN_FROM_LIST: List[str] = ["auto", "claude-sonnet-4", "claude-sonnet-4.5", "claude-opus-4.5", "claude-haiku-4.5"]
 
 # ==================================================================================================
 # Fallback Models Configuration (DNS Failure Recovery)

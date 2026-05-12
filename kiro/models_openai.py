@@ -45,6 +45,10 @@ class OpenAIModel(BaseModel):
     created: int = Field(default_factory=lambda: int(time.time()))
     owned_by: str = "anthropic"
     description: Optional[str] = None
+    # Extended metadata for Codex CLI compatibility
+    context_window: Optional[int] = Field(default=None, alias="context_window")
+    max_tokens: Optional[int] = Field(default=None, alias="max_tokens")
+    capabilities: Optional[Dict[str, bool]] = Field(default=None, alias="capabilities")
 
 
 class ModelList(BaseModel):
